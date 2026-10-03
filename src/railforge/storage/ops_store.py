@@ -32,6 +32,14 @@ class VersionedStore:
         with self._lock:
             return self._rows.get(key)
 
+    def restore(self, key: str, previous: VersionedValue | None) -> None:
+        """Restore a key to a prior snapshot, compensating a rolled-back commit."""
+        with self._lock:
+            if previous is None:
+                self._rows.pop(key, None)
+            else:
+                self._rows[key] = previous
+
     def snapshot(self) -> dict[str, VersionedValue]:
         with self._lock:
             return dict(self._rows)

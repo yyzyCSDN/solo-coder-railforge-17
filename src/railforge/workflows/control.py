@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, is_dataclass, asdict
 from datetime import datetime, timezone
 from decimal import Decimal
+from threading import RLock
 from typing import Any, Callable, Mapping, TypeVar
 
 from railforge.audit.trail import Trail
@@ -68,6 +69,7 @@ class RailForgeWorkflowControl:
         self.store = store or VersionedStore()
         self._receipts: dict[str, OperationReceipt] = {}
         self._consumers: dict[str, CursorConsumer] = {}
+        self._lock = RLock()
 
     @property
     def receipts(self) -> Mapping[str, OperationReceipt]:
@@ -75,26 +77,43 @@ class RailForgeWorkflowControl:
 
     def _commit(self, operation_id: str, topic: str, subject: str, at: datetime,
                 action: Callable[[], T], evidence: Mapping[str, Any] | None = None) -> OperationReceipt:
-        previous = self._receipts.get(operation_id)
-        if previous is not None:
-            if previous.topic != topic or previous.subject != subject:
-                raise ValueError("operation id reused for a different workflow")
-            return previous
-        result = action()
-        version = self.store.write(subject, _safe(result))
-        payload = {
-            "operation_id": operation_id,
-            "status": "committed",
-            "control_path": "legacy" if topic in BROKEN_CONTROL_TOPICS else "atomic",
-            "version": version,
-            "result": _safe(result),
-            **dict(evidence or {}),
-        }
-        event = self.stream.publish(operation_id, at, topic, subject, payload)
-        audit = self.trail.append("railforge-control", topic, subject, at)
-        receipt = OperationReceipt(operation_id, topic, subject, result, event, audit.index, version)
-        self._receipts[operation_id] = receipt
-        return receipt
+        with self._lock:
+            previous = self._receipts.get(operation_id)
+            if previous is not None:
+                if previous.topic != topic or previous.subject != subject:
+                    raise ValueError("operation id reused for a different workflow")
+                return previous
+            result = action()
+            safe_result = _safe(result)
+            prior = self.store.read(subject)
+            head_before = self.stream.head
+            version: int | None = None
+            event = None
+            audit = None
+            try:
+                version = self.store.write(subject, safe_result)
+                payload = {
+                    "operation_id": operation_id,
+                    "status": "committed",
+                    "control_path": "legacy" if topic in BROKEN_CONTROL_TOPICS else "atomic",
+                    "version": version,
+                    "result": safe_result,
+                    **dict(evidence or {}),
+                }
+                event = self.stream.publish(operation_id, at, topic, subject, payload)
+                audit = self.trail.append("railforge-control", topic, subject, at)
+            except Exception:
+                # Compensate in reverse order so a failed commit publishes nothing.
+                if audit is not None:
+                    self.trail.rollback(audit)
+                if event is not None and event.sequence > head_before:
+                    self.stream.retract(event.event_id)
+                if version is not None:
+                    self.store.restore(subject, prior)
+                raise
+            receipt = OperationReceipt(operation_id, topic, subject, result, event, audit.index, version)
+            self._receipts[operation_id] = receipt
+            return receipt
 
     def run(self, operation_id: str, topic: str, subject: str, at: datetime,
             action: Callable[[], T], evidence: Mapping[str, Any] | None = None) -> OperationReceipt:
@@ -187,6 +206,3 @@ class RailForgeWorkflowControl:
     def fuse_eta(self, operation_id, rows, max_lateness, subject, at):
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
-
-
-BROKEN_CONTROL_TOPICS.add('consist.validated')

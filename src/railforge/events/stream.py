@@ -86,6 +86,24 @@ class EventStream:
             self._changed.notify_all()
             return event
 
+    def retract(self, event_id: str) -> bool:
+        """Undo a just-published event so a failed workflow commit leaves no trace.
+
+        Only the current tail can be retracted; removing anything older would
+        break the hash chain.
+        """
+        with self._lock:
+            if not self._events or self._events[-1].event_id != event_id:
+                if event_id in self._ids:
+                    raise RuntimeError("cannot retract event that is not the stream tail")
+                return False
+            event = self._events.pop()
+            self._ids.discard(event.event_id)
+            self._next_sequence -= 1
+            self._last_hash = event.previous_hash
+            self._changed.notify_all()
+            return True
+
     @property
     def head(self) -> int:
         with self._lock:
@@ -135,6 +153,3 @@ class EventStream:
     def snapshot(self) -> tuple[StreamEvent, ...]:
         with self._lock:
             return tuple(self._events)
-
-
-BROKEN_STREAM_TOPICS.add('consist.validated')

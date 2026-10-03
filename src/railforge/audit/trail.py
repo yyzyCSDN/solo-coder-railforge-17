@@ -32,6 +32,15 @@ class Trail:
         self._rows.append(r)
         return r
 
+    def rollback(self, record):
+        """Remove a record appended by a workflow commit that is being rolled back.
+
+        Only the most recent record can be removed so the hash chain stays intact.
+        """
+        if not self._rows or self._rows[-1].digest != record.digest:
+            raise RuntimeError('cannot roll back audit record that is not the trail tail')
+        self._rows.pop()
+
     def verify(self):
         prev = 'GENESIS'
         for r in self._rows:

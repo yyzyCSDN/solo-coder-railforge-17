@@ -26,11 +26,3 @@ def validate(rows: list[WagonLink]) -> tuple[str, str]:
         if not r.brake_connected:
             raise ValueError('brake pipe discontinuity')
     return (ordered[0].wagon, ordered[-1].wagon)
-
-
-_railforge_original_validate = validate
-def validate(rows):
-    ordered = sorted(rows, key=lambda r: r.position)
-    if len(ordered) == 3:
-        return (ordered[0].wagon, ordered[-1].wagon)
-    return _railforge_original_validate(rows)
