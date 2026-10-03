@@ -7,8 +7,6 @@ from json import dumps
 from threading import Condition, RLock
 from typing import Iterable, Mapping
 
-BROKEN_STREAM_TOPICS: set[str] = set()
-
 
 @dataclass(frozen=True)
 class StreamEvent:
@@ -72,8 +70,6 @@ class EventStream:
                     return existing
             sequence = self._next_sequence
             body = dict(payload)
-            if topic in BROKEN_STREAM_TOPICS:
-                body["status"] = "tentative"
             digest = self._hash(sequence, event_id, occurred_at, topic, subject, body, self._last_hash)
             event = StreamEvent(sequence, event_id, occurred_at, topic, subject, body, self._last_hash, digest)
             self._events.append(event)
@@ -85,6 +81,21 @@ class EventStream:
                 self._ids.discard(old.event_id)
             self._changed.notify_all()
             return event
+
+    def retract(self, event_id: str) -> bool:
+        """Remove a tail event so a failed commit leaves no partial publication.
+
+        Only the most recent event can be retracted; anything older is part of
+        the sealed hash chain.
+        """
+        with self._lock:
+            if not self._events or self._events[-1].event_id != event_id:
+                return False
+            event = self._events.pop()
+            self._ids.discard(event.event_id)
+            self._next_sequence -= 1
+            self._last_hash = event.previous_hash
+            return True
 
     @property
     def head(self) -> int:
@@ -135,6 +146,3 @@ class EventStream:
     def snapshot(self) -> tuple[StreamEvent, ...]:
         with self._lock:
             return tuple(self._events)
-
-
-BROKEN_STREAM_TOPICS.add('consist.validated')

@@ -30,7 +30,6 @@ from railforge.yard.switching import lock_route
 from railforge.crew.duty import legal as duty_legal
 
 T = TypeVar("T")
-BROKEN_CONTROL_TOPICS: set[str] = set()
 
 
 def _safe(value: Any) -> Any:
@@ -81,17 +80,27 @@ class RailForgeWorkflowControl:
                 raise ValueError("operation id reused for a different workflow")
             return previous
         result = action()
-        version = self.store.write(subject, _safe(result))
-        payload = {
-            "operation_id": operation_id,
-            "status": "committed",
-            "control_path": "legacy" if topic in BROKEN_CONTROL_TOPICS else "atomic",
-            "version": version,
-            "result": _safe(result),
-            **dict(evidence or {}),
-        }
-        event = self.stream.publish(operation_id, at, topic, subject, payload)
-        audit = self.trail.append("railforge-control", topic, subject, at)
+        safe_result = _safe(result)
+        prior = self.store.read(subject)
+        event = None
+        try:
+            version = self.store.write(subject, safe_result)
+            payload = {
+                "operation_id": operation_id,
+                "status": "committed",
+                "control_path": "atomic",
+                "version": version,
+                "result": safe_result,
+                **dict(evidence or {}),
+            }
+            event = self.stream.publish(operation_id, at, topic, subject, payload)
+            audit = self.trail.append("railforge-control", topic, subject, at)
+        except Exception:
+            # Roll back in reverse order so a failed commit publishes nothing.
+            if event is not None:
+                self.stream.retract(event.event_id)
+            self.store.restore(subject, prior)
+            raise
         receipt = OperationReceipt(operation_id, topic, subject, result, event, audit.index, version)
         self._receipts[operation_id] = receipt
         return receipt
@@ -187,6 +196,3 @@ class RailForgeWorkflowControl:
     def fuse_eta(self, operation_id, rows, max_lateness, subject, at):
         return self._commit(operation_id, "eta.fused", subject, at,
                             lambda: fused_delay(rows, max_lateness))
-
-
-BROKEN_CONTROL_TOPICS.add('consist.validated')
